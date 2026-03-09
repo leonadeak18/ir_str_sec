@@ -1,0 +1,518 @@
+---
+title: "Untitled"
+format: html
+---
+
+# Introduction
+This notebook will explore the usage of Compositional Data Analysis (CoDA) techniques in the infrared spectroscopy of protein samples.
+
+# Data Import
+```{r}
+## Import the reference data
+data <- read.csv("data/data.csv")
+ref <- data[, c(1:5)]
+spectra <- data[, c(1, 6:ncol(data))]
+source("utils/preparation.R")
+spectra <- prepare_df(spectra, 900, 2000)
+rownames(spectra) <- spectra[,1]
+spectra <- spectra[,-1]
+```
+
+# Compositional Data Analysis (CoDA) Preparation
+
+```{r}
+#import CoDA packages
+library(compositions)
+
+# replace zero on the reference data with a very small value (0.0001)
+ref[ref == 0] <- 0.0001
+
+## The total amount is meaningless or the individual amounts are part of a whole (in equal units) and the data should be analyzed in a relative geometry
+y_acomp <- acomp(ref[,-1])
+y_ilr <- as.matrix(ilr(y_acomp))
+rownames(y_ilr) <- ref$PDB.Num
+
+## The total amount is meaningful and the data should be analyzed in relative geometry
+y_aplus <- aplus(ref[,-1])
+y_ilt <- as.matrix(ilt(y_aplus))
+rownames(y_ilt) <- ref$PDB.Num
+
+## The total amount is constant, but data is treated using absolute geometry. 
+y_rcomp <- rcomp(ref[,-1])
+y_ipt <- as.matrix(ipt(y_rcomp))
+rownames(y_ipt) <- ref$PDB.Num
+
+## The total amount matters, and differences are treated absolutely.
+y_rplus <- rplus(ref[,-1])
+y_iit <- as.matrix(iit(y_rplus))
+rownames(y_iit) <- ref$PDB.Num
+
+y_coda <- list(
+  "ilr" = y_ilr,
+  "ilt" = y_ilt,
+  "ipt" = y_ipt,
+  "iit" = y_iit
+)
+
+#create an X_list
+X_list <- list(
+  "Full_spectra" = spectra,
+  "amide_I" = spectra[, as.numeric(colnames(spectra)) >= 1600 & as.numeric(colnames(spectra)) <= 1700],
+  "amide_I_II" = spectra[, as.numeric(colnames(spectra)) >= 1500 & as.numeric(colnames(spectra)) <= 1700]
+)
+
+```
+
+# Preprocessing Spectra
+```{r}
+library(prospectr)
+library(spectacles)
+
+prep <- list(
+    'Raw' = function(x) {x},
+    'SNV' = function(x){standardNormalVariate(x)},
+    '1st_Der' = function(x){savitzkyGolay(x, w = 11, porder = 2, dorder = 1)},
+    '2nd_Der' = function(x){savitzkyGolay(x, w = 11, porder = 2, dorder = 2)},
+    'EMSC' = function(x){
+      df <- EMSC(x, degree = 2)
+      return(df$corrected)
+    },
+    'RNV' = function(x){
+      rnv(x, r = 0.25)
+    }
+)
+
+
+``` 
+
+## Modelling and evaluation
+### PLS
+
+```{r}
+library(pls)
+library(plsVarSel)
+library(spectacles)
+
+# Helper function 
+calculate_cv_metrics <- function(model, y, ncomp) {
+  preds_cv <- model$validation$pred[, , ncomp]
+  y_mat <- as.matrix(y)
+  
+  RMSECV <- sqrt(mean((preds_cv - y_mat)^2))
+  
+  ss_res <- sum((preds_cv - y_mat)^2)
+  ss_tot <- sum(scale(y_mat, scale = FALSE)^2)
+  R2_CV <- 1 - (ss_res / ss_tot)
+  
+  RPD_CV <- sd(as.vector(y_mat)) / RMSECV
+  
+  return(list(R2 = R2_CV, RMSE = RMSECV, RPD = RPD_CV))
+}
+
+# Main function
+pipeline <- function(X_list, y_list, max_comp = 20, k_folds = 5) {
+  
+  final_results <- data.frame()
+  # loop through each dataset
+  for (i in seq_along(X_list)) {
+    # add baseline correction to the raw spectra
+    X <- X_list[[i]]
+    wavenumbers <- as.numeric(colnames(X))
+    X_raw <- baseline(X, wavenumbers)
+     for(j in seq_along(y_list)){
+      y <- y_list[[j]]
+      dataset_name <- paste("Dataset", i , "with Ref", j)
+            
+      # Loop through each preprocessing
+      #preprocessing methods
+      prep <- list(
+          'Raw' = function(x) {
+              savitzkyGolay(x, w = 15, p = 2, m = 0)},
+          'SNV' = function(x){
+              standardNormalVariate(savitzkyGolay(x, w = 15, p = 2, m = 0))
+              },
+          '1st_Der' = function(x){
+              savitzkyGolay(x, w = 9, p = 2, m = 1)
+              },
+          '2nd_Der' = function(x){
+              savitzkyGolay(x, w = 9, p = 2, m = 2)
+          },
+          'EMSC' = function(x){
+              df <- EMSC(savitzkyGolay(x, w = 15, p = 2, m = 0), degree = 2)
+              return(df$corrected)
+          },
+          "RNV" = function(x){
+              rnv(x, r = 0.25)
+          }
+      )
+      for (prep_name in names(prep)) {
+        X_prep <- prep[[prep_name]](X_raw)
+          # Loop through each variable selection method
+          # variable selection methods
+          varsel <- list(
+              "None" = function(x){1:ncol(x)},
+              "VIP" = function(x) {
+                  df <- filterPLSR(y, x, ncomp = max_comp, ncomp.opt = "minimum", validation = "CV", segments = k_folds, VIP.threshold = 0.7)
+                  return(df$VIP)
+                  },
+              "SR" = function(x) {
+                  df <- filterPLSR(y, x, ncomp = max_comp, ncomp.opt = "minimum", validation = "CV", segments = k_folds, SR.threshold = 0.7)
+                  return(df$SR)
+              },
+              "sMC" = function(x) {
+                  df <- filterPLSR(y, x, ncomp = max_comp, ncomp.opt = "minimum", validation = "CV", segments = k_folds, sMC.threshold = 0.05)
+                  return(df$sMC)
+              },
+              "UVE" = function(x) {
+                  df <- mcuve_pls(y, x, ncomp = max_comp, N = 7)
+                  return(df$mcuve.selection)
+              }
+          )
+        for (vs_name in names(varsel)) {
+          selected_vars <- varsel[[vs_name]](X_prep)
+          
+          # Skip to the next iteration if fewer than 2 variables are selected (to prevent PLS errors)
+          selected_vars <- as.numeric(selected_vars)
+          selected_vars <- selected_vars[!is.na(selected_vars) & selected_vars > 0]
+          if (length(selected_vars) < 2) {
+            next
+          }
+          
+          # Subset the preprocessed spectra
+          X_sel <- X_prep[, selected_vars, drop = FALSE]
+          
+          # Cap max components so it doesn't exceed the number of selected variables
+          current_max_comp <- min(max_comp, length(selected_vars))
+          
+          # Refit PLS with the selected variables and calculate metrics
+          train_data <- data.frame(y = y)
+          train_data$X_sel <- I(as.matrix(X_sel))
+          refit_pls <- plsr(y ~ X_sel, data = train_data,ncomp = current_max_comp, validation = "CV", segments = k_folds)
+          
+          # Find new optimal components for the refitted model
+          rmse_cv_refit <- RMSEP(refit_pls, estimate = "CV")$val[1,1,]
+          opt_comp_refit <- which.min(rmse_cv_refit[-1])
+          
+          # Calculate final metrics
+          refit_metrics <- calculate_cv_metrics(refit_pls, y, opt_comp_refit)
+          print(paste(dataset_name, "with Preprocessing:", prep_name, "and Var Selection:", vs_name, "is done"))
+          # Store results
+          final_results <- rbind(final_results, data.frame(
+            Dataset = dataset_name, 
+            Preprocessing = prep_name, 
+            Var_Selection = vs_name, 
+            ncomp = opt_comp_refit,
+            R2_CV = refit_metrics$R2, 
+            RMSECV = refit_metrics$RMSE, 
+            RPD_CV = refit_metrics$RPD
+          ))
+        }
+      }
+    }
+  }
+  print("Pipeline execution completed!")
+  return(final_results)
+}
+
+```
+
+
+```{r}
+sec_str_plsr <- pipeline(X = X_list, y_list = y_coda)
+write.csv(sec_str_plsr, "pls_pipeline_results.csv", row.names = FALSE)
+save.image("pls_pipeline_results.RData")
+```
+
+
+## Kernel pls
+
+```{r}
+library('bigPLSR')
+# Main function
+bigPLSR_pipeline <- function(X_list, y_list, max_comp = 20, k_folds = 5) {
+  
+  final_results_bigPLSR <- data.frame()
+  # loop through each dataset
+  for (i in seq_along(X_list)) {
+    # add baseline correction to the raw spectra
+    X <- X_list[[i]]
+    wavenumbers <- as.numeric(colnames(X))
+    X_raw <- baseline(X, wavenumbers)
+     for(j in seq_along(y_list)){
+      y <- y_list[[j]]
+      dataset_name <- paste("Dataset", i , "with Ref", j)
+            
+      # Loop through each preprocessing
+      #preprocessing methods
+      prep <- list(
+          'Raw' = function(x) {
+              savitzkyGolay(x, w = 15, p = 2, m = 0)},
+          'SNV' = function(x){
+              standardNormalVariate(savitzkyGolay(x, w = 15, p = 2, m = 0))
+              },
+          '1st_Der' = function(x){
+              savitzkyGolay(x, w = 9, p = 2, m = 1)
+              },
+          '2nd_Der' = function(x){
+              savitzkyGolay(x, w = 9, p = 2, m = 2)
+          },
+          'EMSC' = function(x){
+              df <- EMSC(savitzkyGolay(x, w = 15, p = 2, m = 0), degree = 2)
+              return(df$corrected)
+          },
+          "RNV" = function(x){
+              rnv(x, r = 0.25)
+          }
+      )
+      for (prep_name in names(prep)) {
+        X_prep <- prep[[prep_name]](X_raw)
+          # Loop through each variable selection method
+          # variable selection methods
+          varsel <- list(
+              "None" = function(x){1:ncol(x)},
+              "VIP" = function(x) {
+                  df <- filterPLSR(y, x, ncomp = max_comp, ncomp.opt = "minimum", validation = "CV", segments = k_folds, VIP.threshold = 0.7)
+                  return(df$VIP)
+                  },
+              "SR" = function(x) {
+                  df <- filterPLSR(y, x, ncomp = max_comp, ncomp.opt = "minimum", validation = "CV", segments = k_folds, SR.threshold = 0.7)
+                  return(df$SR)
+              },
+              "sMC" = function(x) {
+                  df <- filterPLSR(y, x, ncomp = max_comp, ncomp.opt = "minimum", validation = "CV", segments = k_folds, sMC.threshold = 0.05)
+                  return(df$sMC)
+              },
+              "UVE" = function(x) {
+                  df <- mcuve_pls(y, x, ncomp = max_comp, N = 7)
+                  return(df$mcuve.selection)
+              },
+              "GA" = function(x) {
+                  set.seed(123)
+                  df <- ga_pls(y, x, GA.threshold = 10, iters = 10, popSize = 50)
+                  return(df$ga.selection)
+              }
+          )
+        for (vs_name in names(varsel)) {
+          selected_vars <- varsel[[vs_name]](X_prep)
+          
+          # Skip to the next iteration if fewer than 2 variables are selected (to prevent PLS errors)
+          selected_vars <- as.numeric(selected_vars)
+          selected_vars <- selected_vars[!is.na(selected_vars) & selected_vars > 0]
+          if (length(selected_vars) < 2) {
+            next
+          }
+          
+          # Subset the preprocessed spectra
+          X_sel <- X_prep[, selected_vars, drop = FALSE]
+          
+          # Cap max components so it doesn't exceed the number of selected variables
+          current_max_comp <- min(max_comp, length(selected_vars))
+          
+          # PLS cross-validation with various techniques
+          pls_method <- c("simpls", "nipals","kernelpls", "widekernelpls")
+          for (method in pls_method){
+            refit_pls <- pls_cross_validate(X = X_sel, Y = y, ncomp = current_max_comp, algorithm = method, metrics = c("rmse", "mae", "r2"), folds = k_folds)
+            
+            #select the lowest rmse
+            best_ncomp <- refit_pls$summary$ncomp[refit_pls$summary$metric == "rmse"][which.min(refit_pls$summary$value[refit_pls$summary$metric == "rmse"])]
+            best_metrics <- refit_pls$summary[refit_pls$summary$ncomp == best_ncomp, ]
+
+            final_results_bigPLSR <- rbind(final_results_bigPLSR, data.frame(
+              Dataset = dataset_name, 
+              Preprocessing = prep_name, 
+              Var_Selection = vs_name, 
+              PLS_Method = method,
+              ncomp = best_ncomp,
+              R2 = best_metrics$value[best_metrics$metric == "r2"],
+              RMSE = best_metrics$value[best_metrics$metric == "rmse"],
+              MAE = best_metrics$value[best_metrics$metric == "mae"]
+            ))
+            print(paste(dataset_name, "with Preprocessing:", prep_name, "Var Selection:", vs_name, "and PLS Method:", method, "is done"))
+          }
+        }
+      }
+    }
+  }
+  print("Pipeline execution completed!")
+  return(final_results_bigPLSR)
+}
+
+```
+```{r}
+sec_str_big_plsr <- bigPLSR_pipeline(X = X_list, y_list = y_coda)
+write.csv(sec_str_big_plsr, "bigPLSR_pipeline_results.csv", row.names = FALSE)
+save.image("sec_structure.RData")
+```
+
+## Random Forest
+
+```{r}
+library(randomForestSRC)
+library(kernlab)
+
+rf_cv_tune <- function(X, Y, folds = 5) {
+  n_samples <- nrow(X)
+  n_features <- ncol(X)
+  n_cols <- ncol(Y) # Capture the number of CoDA columns
+  
+  # Define the tuning grid for mtry
+  mtry_grid <- unique(c(
+    max(1, floor(sqrt(n_features))), 
+    max(1, floor(n_features / 3)), 
+    max(1, floor(n_features / 2))
+  ))
+  
+  set.seed(42)
+  fold_ids <- sample(rep(1:folds, length.out = n_samples))
+  
+  best_rmse <- Inf
+  best_metrics <- list()
+  
+  # Loop through the grid to find the best mtry
+  for (m in mtry_grid) {
+    Y_pred_cv <- matrix(NA, nrow = n_samples, ncol = n_cols)
+    
+    # --- THE FIX: Loop through each column of the Y matrix ---
+    for (c in 1:n_cols) {
+      y_col <- Y[, c]
+      
+      for (k in 1:folds) {
+        train_idx <- which(fold_ids != k)
+        test_idx <- which(fold_ids == k)
+        
+        # Train Random Forest on the specific column
+        # (I also set ntree to 500 here as we discussed!)
+        rf_model <- randomForest(x = X[train_idx, , drop = FALSE], 
+                                 y = y_col[train_idx], 
+                                 mtry = m, ntree = 500)
+        
+        Y_pred_cv[test_idx, c] <- predict(rf_model, X[test_idx, , drop = FALSE])
+      }
+    }
+    # ---------------------------------------------------------
+    
+    # Calculate global RMSE for this tuning parameter across all predicted columns
+    Y_flat <- as.numeric(Y)
+    Pred_flat <- as.numeric(Y_pred_cv)
+    current_rmse <- sqrt(mean((Y_flat - Pred_flat)^2))
+    
+    # If this is the best tuning so far, save the metrics
+    if (current_rmse < best_rmse) {
+      best_rmse <- current_rmse
+      rss <- sum((Y_flat - Pred_flat)^2)
+      tss <- sum((Y_flat - mean(Y_flat))^2)
+      
+      best_metrics <- list(
+        r2 = 1 - (rss / tss),
+        rmse = current_rmse,
+        mae = mean(abs(Y_flat - Pred_flat)),
+        best_mtry = m
+      )
+    }
+  }
+  return(best_metrics)
+}
+
+
+rf_pipeline <- function(X_list, y_list, max_comp = 20, k_folds = 5) {
+  
+  final_results_RF <- data.frame()
+  
+  for (i in seq_along(X_list)) {
+    X <- X_list[[i]]
+    wavenumbers <- as.numeric(colnames(X))
+    X_raw <- baseline(X, wavenumbers)
+    
+    for(j in seq_along(y_list)){
+      y <- y_list[[j]]
+      dataset_name <- paste("Dataset", i , "with Ref", j)
+      
+      # Preprocessing Methods
+      prep <- list(
+          'Raw' = function(x) { savitzkyGolay(x, w = 15, p = 2, m = 0) },
+          'SNV' = function(x) { standardNormalVariate(savitzkyGolay(x, w = 15, p = 2, m = 0)) },
+          '1st_Der' = function(x) { savitzkyGolay(x, w = 9, p = 2, m = 1) },
+          '2nd_Der' = function(x) { savitzkyGolay(x, w = 9, p = 2, m = 2) },
+          'EMSC' = function(x) { 
+              df <- EMSC(savitzkyGolay(x, w = 15, p = 2, m = 0), degree = 2)
+              return(df$corrected) 
+          },
+          "RNV" = function(x) { rnv(x, r = 0.25) }
+      )
+      
+      for (prep_name in names(prep)) {
+        X_prep <- prep[[prep_name]](X_raw)
+        
+        # Variable Selection / Feature Extraction Methods
+        # Notice: They all now return the transformed X matrix directly!
+        varsel <- list(
+            "None" = function(x, y_ref) { return(x) },
+            
+            "VIP" = function(x, y_ref) {
+                df <- filterPLSR(y_ref, x, ncomp = max_comp, ncomp.opt = "minimum", validation = "CV", segments = k_folds, VIP.threshold = 0.7)
+                vars <- as.numeric(df$VIP)
+                vars <- vars[!is.na(vars) & vars > 0]
+                if(length(vars) < 2) return(NULL)
+                return(x[, vars, drop = FALSE])
+            },
+            
+            "GA" = function(x, y_ref) {
+                set.seed(123)
+                df <- ga_pls(y_ref, x, GA.threshold = 10, iters = 10, popSize = 50)
+                vars <- as.numeric(df$ga.selection)
+                vars <- vars[!is.na(vars) & vars > 0]
+                if(length(vars) < 2) return(NULL)
+                return(x[, vars, drop = FALSE])
+            },
+            
+            "PCA" = function(x, y_ref) {
+                pca_mod <- prcomp(x, center = TRUE, scale. = TRUE)
+                # Keep top components up to max_comp
+                return(pca_mod$x[, 1:min(max_comp, ncol(pca_mod$x)), drop = FALSE])
+            },
+            
+            "Kernel_PCA" = function(x, y_ref) {
+                # Uses the kernlab package
+                kpca_mod <- kpca(~., data = as.data.frame(x), kernel = "rbfdot", features = max_comp)
+                return(rotated(kpca_mod))
+            }
+        )
+        
+        for (vs_name in names(varsel)) {
+          
+          # Pass both X_prep and y (needed for VIP and GA)
+          X_sel <- varsel[[vs_name]](X_prep, y)
+          
+          # Skip if the selection method failed or returned too few variables
+          if (is.null(X_sel) || ncol(X_sel) < 2) {
+            next
+          }
+          
+          # Call the new Random Forest Cross-Validation and Tuning function
+          rf_metrics <- rf_cv_tune(X = X_sel, Y = y, folds = k_folds)
+          
+          final_results_RF <- rbind(final_results_RF, data.frame(
+            Dataset = dataset_name, 
+            Preprocessing = prep_name, 
+            Var_Selection = vs_name, 
+            Model_Method = "Random_Forest",
+            Best_Mtry = rf_metrics$best_mtry,
+            R2 = rf_metrics$r2,
+            RMSE = rf_metrics$rmse,
+            MAE = rf_metrics$mae
+          ))
+          
+          print(paste(dataset_name, "| Prep:", prep_name, "| Extractor:", vs_name, "| Tuned RF is done!"))
+        }
+      }
+    }
+  }
+  print("Pipeline execution completed!")
+  return(final_results_RF)
+}
+```
+
+
+```{r}
+sec_str_rf <- rf_pipeline(X_list = X_list, y_list = y_coda)
+```

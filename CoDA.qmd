@@ -348,6 +348,7 @@ save.image("sec_structure.RData")
 
 ```{r}
 library(randomForestSRC)
+library(randomForest)
 library(kernlab)
 
 rf_cv_tune <- function(X, Y, folds = 5) {
@@ -466,17 +467,30 @@ rf_pipeline <- function(X_list, y_list, max_comp = 20, k_folds = 5) {
             },
             
             "PCA" = function(x, y_ref) {
-                pca_mod <- prcomp(x, center = TRUE, scale. = TRUE)
-                # Keep top components up to max_comp
+                # 1. Identify and keep only columns with actual variance
+                valid_cols <- apply(x, 2, var) > 1e-10
+                x_clean <- x[, valid_cols, drop = FALSE]
+                
+                # 2. Safety check in case too many columns were dropped
+                if(ncol(x_clean) < 2) return(NULL)
+                
+                # 3. Run PCA safely on the clean data
+                pca_mod <- prcomp(x_clean, center = TRUE, scale. = TRUE)
                 return(pca_mod$x[, 1:min(max_comp, ncol(pca_mod$x)), drop = FALSE])
             },
             
             "Kernel_PCA" = function(x, y_ref) {
-                # Uses the kernlab package
-                kpca_mod <- kpca(~., data = as.data.frame(x), kernel = "rbfdot", features = max_comp)
+                # 1. Identify and keep only columns with actual variance
+                valid_cols <- apply(x, 2, var) > 1e-10
+                x_clean <- x[, valid_cols, drop = FALSE]
+                
+                if(ncol(x_clean) < 2) return(NULL)
+                
+                # 2. Run Kernel PCA on the clean data
+                kpca_mod <- kpca(~., data = as.data.frame(x_clean), kernel = "rbfdot", features = max_comp)
                 return(rotated(kpca_mod))
             }
-        )
+          )
         
         for (vs_name in names(varsel)) {
           
@@ -515,4 +529,215 @@ rf_pipeline <- function(X_list, y_list, max_comp = 20, k_folds = 5) {
 
 ```{r}
 sec_str_rf <- rf_pipeline(X_list = X_list, y_list = y_coda)
+write.csv(sec_str_rf, "rf_pipeline_results.csv", row.names = FALSE)
+save.image("sec_structure.RData")
+```
+
+
+```{r}
+# 1. Define only the packages needed for the XGBoost pipeline
+xgb_packages <- c(
+  "xgboost",     # The core machine learning algorithm
+  "compositions",# For your ternary CoDA math (ilr, ilt, etc.)
+  "baseline",    # For your initial baseline correction
+  "prospectr",   # For Savitzky-Golay, SNV, and derivatives
+  "EMSC",        # For your EMSC preprocessing block
+  "plsVarSel",   # For the VIP and Genetic Algorithm (GA) extractors
+  "kernlab"      # For the Kernel PCA extractor
+)
+
+# 2. Loop through and install/load automatically
+for (pkg in xgb_packages) {
+  # If the package is missing, install it
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    message(paste("Installing missing package:", pkg))
+    install.packages(pkg, dependencies = TRUE)
+  }
+  
+  # Load it into the environment
+  library(pkg, character.only = TRUE)
+}
+
+message("All XGBoost pipeline packages are installed and loaded!")
+
+xgb_cv_tune <- function(X, Y, folds = 5) {
+  n_samples <- nrow(X)
+  n_cols <- ncol(Y)
+  
+  # A streamlined tuning grid perfect for spectroscopy
+  tune_grid <- expand.grid(
+    max_depth = c(3, 6),       # Shallow trees prevent overfitting the noise
+    eta = c(0.05, 0.1),        # Slower learning rates are generally safer
+    nrounds = c(100, 200)      # Max iterations
+  )
+  
+  set.seed(42)
+  fold_ids <- sample(rep(1:folds, length.out = n_samples))
+  
+  best_rmse <- Inf
+  best_metrics <- list()
+  
+  # Loop through the grid
+  for (i in 1:nrow(tune_grid)) {
+    params <- tune_grid[i, ]
+    Y_pred_cv <- matrix(NA, nrow = n_samples, ncol = n_cols)
+    
+    # Loop through each column of the CoDA Y matrix
+    for (c in 1:n_cols) {
+      y_col <- Y[, c]
+      
+      for (k in 1:folds) {
+        train_idx <- which(fold_ids != k)
+        test_idx <- which(fold_ids == k)
+        
+        # XGBoost requires explicit matrix conversion
+        dtrain <- xgb.DMatrix(data = as.matrix(X[train_idx, , drop = FALSE]), label = y_col[train_idx])
+        dtest <- xgb.DMatrix(data = as.matrix(X[test_idx, , drop = FALSE]))
+        
+        # Train the model
+        xgb_model <- xgb.train(
+          params = list(
+            objective = "reg:squarederror",
+            max_depth = params$max_depth,
+            eta = params$eta
+          ),
+          data = dtrain,
+          nrounds = params$nrounds,
+          verbose = 0 # Keeps your console clean!
+        )
+        
+        Y_pred_cv[test_idx, c] <- predict(xgb_model, dtest)
+      }
+    }
+    
+    # Calculate global metrics
+    Y_flat <- as.numeric(Y)
+    Pred_flat <- as.numeric(Y_pred_cv)
+    current_rmse <- sqrt(mean((Y_flat - Pred_flat)^2))
+    
+    # Save if it is the best one
+    if (current_rmse < best_rmse) {
+      best_rmse <- current_rmse
+      rss <- sum((Y_flat - Pred_flat)^2)
+      tss <- sum((Y_flat - mean(Y_flat))^2)
+      
+      best_metrics <- list(
+        r2 = 1 - (rss / tss),
+        rmse = current_rmse,
+        mae = mean(abs(Y_flat - Pred_flat)),
+        best_depth = params$max_depth,
+        best_eta = params$eta,
+        best_nrounds = params$nrounds
+      )
+    }
+  }
+  return(best_metrics)
+}
+
+xgb_pipeline <- function(X_list, y_list, max_comp = 20, k_folds = 5) {
+  
+  final_results_XGB <- data.frame()
+  
+  for (i in seq_along(X_list)) {
+    X <- X_list[[i]]
+    wavenumbers <- as.numeric(colnames(X))
+    X_raw <- baseline(X, wavenumbers)
+    
+    for(j in seq_along(y_list)){
+      y <- y_list[[j]]
+      dataset_name <- paste("Dataset", i , "with Ref", j)
+      
+      # Preprocessing Methods
+      prep <- list(
+          'Raw' = function(x) { savitzkyGolay(x, w = 15, p = 2, m = 0) },
+          'SNV' = function(x) { standardNormalVariate(savitzkyGolay(x, w = 15, p = 2, m = 0)) },
+          '1st_Der' = function(x) { savitzkyGolay(x, w = 9, p = 2, m = 1) },
+          '2nd_Der' = function(x) { savitzkyGolay(x, w = 9, p = 2, m = 2) },
+          'EMSC' = function(x) { 
+              df <- EMSC(savitzkyGolay(x, w = 15, p = 2, m = 0), degree = 2)
+              return(df$corrected) 
+          },
+          "RNV" = function(x) { rnv(x, r = 0.25) }
+      )
+      
+      for (prep_name in names(prep)) {
+        X_prep <- prep[[prep_name]](X_raw)
+        
+        # Variable Selection / Feature Extraction Methods
+        varsel <- list(
+            "None" = function(x, y_ref) { return(x) },
+            
+            "VIP" = function(x, y_ref) {
+                df <- filterPLSR(y_ref, x, ncomp = max_comp, ncomp.opt = "minimum", validation = "CV", segments = k_folds, VIP.threshold = 0.7)
+                vars <- as.numeric(df$VIP)
+                vars <- vars[!is.na(vars) & vars > 0]
+                if(length(vars) < 2) return(NULL)
+                return(x[, vars, drop = FALSE])
+            },
+            
+            "GA" = function(x, y_ref) {
+                set.seed(123)
+                df <- ga_pls(y_ref, x, GA.threshold = 10, iters = 10, popSize = 50)
+                vars <- as.numeric(df$ga.selection)
+                vars <- vars[!is.na(vars) & vars > 0]
+                if(length(vars) < 2) return(NULL)
+                return(x[, vars, drop = FALSE])
+            },
+            
+            "PCA" = function(x, y_ref) {
+                valid_cols <- apply(x, 2, var) > 1e-10
+                x_clean <- x[, valid_cols, drop = FALSE]
+                if(ncol(x_clean) < 2) return(NULL)
+                pca_mod <- prcomp(x_clean, center = TRUE, scale. = TRUE)
+                return(pca_mod$x[, 1:min(max_comp, ncol(pca_mod$x)), drop = FALSE])
+            },
+            
+            "Kernel_PCA" = function(x, y_ref) {
+                valid_cols <- apply(x, 2, var) > 1e-10
+                x_clean <- x[, valid_cols, drop = FALSE]
+                if(ncol(x_clean) < 2) return(NULL)
+                kpca_mod <- kpca(~., data = as.data.frame(x_clean), kernel = "rbfdot", features = max_comp)
+                return(rotated(kpca_mod))
+            }
+        )
+        
+        for (vs_name in names(varsel)) {
+          
+          X_sel <- varsel[[vs_name]](X_prep, y)
+          
+          if (is.null(X_sel) || ncol(X_sel) < 2) {
+            next
+          }
+          
+          # Call the new XGBoost Cross-Validation and Tuning function
+          xgb_metrics <- xgb_cv_tune(X = X_sel, Y = y, folds = k_folds)
+          
+          final_results_XGB <- rbind(final_results_XGB, data.frame(
+            Dataset = dataset_name, 
+            Preprocessing = prep_name, 
+            Var_Selection = vs_name, 
+            Model_Method = "XGBoost",
+            Best_Depth = xgb_metrics$best_depth,
+            Best_Eta = xgb_metrics$best_eta,
+            Best_Nrounds = xgb_metrics$best_nrounds,
+            R2 = xgb_metrics$r2,
+            RMSE = xgb_metrics$rmse,
+            MAE = xgb_metrics$mae
+          ))
+          
+          print(paste(dataset_name, "| Prep:", prep_name, "| Extractor:", vs_name, "| Tuned XGBoost is done!"))
+        }
+      }
+    }
+  }
+  print("XGBoost Pipeline execution completed!")
+  return(final_results_XGB)
+}
+```
+
+
+```{r}
+sec_str_xgb <- xgb_pipeline(X_list = X_list, y_list = y_coda)
+write.csv(sec_str_xgb, "xgb_pipeline_results.csv", row.names = FALSE)
+save.image("sec_structure.RData")
 ```

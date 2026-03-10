@@ -166,6 +166,11 @@ pipeline <- function(X_list, y_list, max_comp = 20, k_folds = 5) {
               "UVE" = function(x) {
                   df <- mcuve_pls(y, x, ncomp = max_comp, N = 7)
                   return(df$mcuve.selection)
+              },
+              "GA" = function(x) {
+                  set.seed(123)
+                  df <- ga_pls(y, x, GA.threshold = 10, iters = 10, popSize = 50)
+                  return(df$ga.selection)
               }
           )
         for (vs_name in names(varsel)) {
@@ -533,33 +538,9 @@ write.csv(sec_str_rf, "rf_pipeline_results.csv", row.names = FALSE)
 save.image("sec_structure.RData")
 ```
 
-
+## Xgboost
 ```{r}
-# 1. Define only the packages needed for the XGBoost pipeline
-xgb_packages <- c(
-  "xgboost",     # The core machine learning algorithm
-  "compositions",# For your ternary CoDA math (ilr, ilt, etc.)
-  "baseline",    # For your initial baseline correction
-  "prospectr",   # For Savitzky-Golay, SNV, and derivatives
-  "EMSC",        # For your EMSC preprocessing block
-  "plsVarSel",   # For the VIP and Genetic Algorithm (GA) extractors
-  "kernlab"      # For the Kernel PCA extractor
-)
-
-# 2. Loop through and install/load automatically
-for (pkg in xgb_packages) {
-  # If the package is missing, install it
-  if (!requireNamespace(pkg, quietly = TRUE)) {
-    message(paste("Installing missing package:", pkg))
-    install.packages(pkg, dependencies = TRUE)
-  }
-  
-  # Load it into the environment
-  library(pkg, character.only = TRUE)
-}
-
-message("All XGBoost pipeline packages are installed and loaded!")
-
+library(xgboost)
 xgb_cv_tune <- function(X, Y, folds = 5) {
   n_samples <- nrow(X)
   n_cols <- ncol(Y)
@@ -740,4 +721,416 @@ xgb_pipeline <- function(X_list, y_list, max_comp = 20, k_folds = 5) {
 sec_str_xgb <- xgb_pipeline(X_list = X_list, y_list = y_coda)
 write.csv(sec_str_xgb, "xgb_pipeline_results.csv", row.names = FALSE)
 save.image("sec_structure.RData")
+load("sec_structure.RData")
+```
+
+## Elastic Net
+```{r}
+library(glmnet)
+
+enet_cv_tune <- function(X, Y, folds = 5, alpha = 0.5) {
+  # alpha = 0.5 gives us an even mix of Lasso (variable selection) and Ridge (grouping)
+  
+  n_samples <- nrow(X)
+  n_cols <- ncol(Y)
+  Y_pred_cv <- matrix(NA, nrow = n_samples, ncol = n_cols)
+  
+  set.seed(42)
+  fold_ids <- sample(rep(1:folds, length.out = n_samples))
+  
+  for (k in 1:folds) {
+    train_idx <- which(fold_ids != k)
+    test_idx <- which(fold_ids == k)
+    
+    # Train Elastic Net natively on the multi-output matrix
+    # Note: glmnet requires strict matrices, not dataframes
+    cv_model <- cv.glmnet(x = as.matrix(X[train_idx, , drop = FALSE]), 
+                          y = as.matrix(Y[train_idx, , drop = FALSE]), 
+                          family = "mgaussian", # This handles the multi-output magic!
+                          alpha = alpha,
+                          nfolds = 5) # Internal folds to find the best lambda penalty
+    
+    # Predict the hold-out fold using the absolute best lambda
+    preds <- predict(cv_model, newx = as.matrix(X[test_idx, , drop = FALSE]), s = "lambda.min")
+    
+    # glmnet mgaussian returns a 3D array, so we slice out the predictions we need
+    Y_pred_cv[test_idx, ] <- preds[, , 1]
+  }
+  
+  # Calculate our standard global metrics
+  Y_flat <- as.numeric(Y)
+  Pred_flat <- as.numeric(Y_pred_cv)
+  
+  rss <- sum((Y_flat - Pred_flat)^2)
+  tss <- sum((Y_flat - mean(Y_flat))^2)
+  
+  r2 <- 1 - (rss / tss)
+  rmse <- sqrt(mean((Y_flat - Pred_flat)^2))
+  mae <- mean(abs(Y_flat - Pred_flat))
+  
+  return(list(r2 = r2, rmse = rmse, mae = mae))
+}
+
+enet_pipeline <- function(X_list, y_list, k_folds = 5) {
+  
+  final_results_enet <- data.frame()
+  
+  # loop through each dataset
+  for (i in seq_along(X_list)) {
+    X <- X_list[[i]]
+    wavenumbers <- as.numeric(colnames(X))
+    X_raw <- baseline(X, wavenumbers)
+    
+    for(j in seq_along(y_list)){
+      y <- y_list[[j]]
+      dataset_name <- paste("Dataset", i , "with Ref", j)
+            
+      # Preprocessing methods
+      prep <- list(
+          'Raw' = function(x) { savitzkyGolay(x, w = 15, p = 2, m = 0) },
+          'SNV' = function(x) { standardNormalVariate(savitzkyGolay(x, w = 15, p = 2, m = 0)) },
+          '1st_Der' = function(x) { savitzkyGolay(x, w = 9, p = 2, m = 1) },
+          '2nd_Der' = function(x) { savitzkyGolay(x, w = 9, p = 2, m = 2) },
+          'EMSC' = function(x) { 
+              df <- EMSC(savitzkyGolay(x, w = 15, p = 2, m = 0), degree = 2)
+              return(df$corrected) 
+          },
+          "RNV" = function(x) { rnv(x, r = 0.25) }
+      )
+      
+      for (prep_name in names(prep)) {
+        # 1. Preprocess the data
+        X_prep <- prep[[prep_name]](X_raw)
+        
+        # 2. Skip variable selection and go straight to Elastic Net!
+        # (It automatically drops zero-variance columns internally, so no PCA math crashes)
+        enet_metrics <- enet_cv_tune(X = X_prep, Y = y, folds = k_folds, alpha = 0.5)
+        
+        # 3. Save the results
+        final_results_enet <- rbind(final_results_enet, data.frame(
+          Dataset = dataset_name, 
+          Preprocessing = prep_name, 
+          Var_Selection = "Built-in_ElasticNet", 
+          Model_Method = "Elastic_Net_mgaussian",
+          R2 = enet_metrics$r2,
+          RMSE = enet_metrics$rmse,
+          MAE = enet_metrics$mae
+        ))
+        
+        print(paste(dataset_name, "| Preprocessing:", prep_name, "| Elastic Net is done!"))
+      }
+    }
+  }
+  print("Elastic Net Pipeline execution completed!")
+  return(final_results_enet)
+}
+
+sec_str_enet <- enet_pipeline(X_list = X_list, y_list = y_coda)
+write.csv(sec_str_enet, "enet_pipeline_results.csv", row.names = FALSE)
+save.image("sec_structure_enet.RData")
+```
+
+## Conditional Inference Forests
+
+```{r}
+library(party)
+library(kernlab)
+
+cforest_cv_tune <- function(X, Y, folds = 5) {
+  n_samples <- nrow(X)
+  n_features <- ncol(X)
+  n_cols <- ncol(Y)
+  
+  # Ensure clean column names for the formula interface
+  colnames(Y) <- paste0("Y", 1:n_cols)
+  colnames(X) <- paste0("X", 1:n_features)
+  
+  # Define the tuning grid for mtry
+  mtry_grid <- unique(c(
+    max(1, floor(sqrt(n_features))), 
+    max(1, floor(n_features / 3)), 
+    max(1, floor(n_features / 2))
+  ))
+  
+  set.seed(42)
+  fold_ids <- sample(rep(1:folds, length.out = n_samples))
+  
+  best_rmse <- Inf
+  best_metrics <- list()
+  
+  # Build the native multi-output formula (e.g., "Y1 + Y2 ~ .")
+  y_names <- paste(colnames(Y), collapse = " + ")
+  form <- as.formula(paste(y_names, "~ ."))
+  
+  # Loop through the grid to find the best mtry
+  for (m in mtry_grid) {
+    Y_pred_cv <- matrix(NA, nrow = n_samples, ncol = n_cols)
+    
+    for (k in 1:folds) {
+      train_idx <- which(fold_ids != k)
+      test_idx <- which(fold_ids == k)
+      
+      # Bind X and Y together into dataframes for the formula
+      train_data <- data.frame(Y[train_idx, , drop = FALSE], X[train_idx, , drop = FALSE])
+      test_data <- data.frame(X[test_idx, , drop = FALSE])
+      
+      # Train the Conditional Inference Forest
+      # cforest_unbiased handles the hyperparameter injection
+      cf_model <- cforest(form, 
+                          data = train_data, 
+                          controls = cforest_unbiased(mtry = m, ntree = 500))
+      
+      # Predict outputs
+      # 'party' returns multi-output predictions as a list, so we unlist it back to a matrix
+      preds <- predict(cf_model, newdata = test_data)
+      Y_pred_cv[test_idx, ] <- do.call(rbind, lapply(preds, unlist))
+    }
+    
+    # Calculate global metrics for this tuning parameter
+    Y_flat <- as.numeric(Y)
+    Pred_flat <- as.numeric(Y_pred_cv)
+    current_rmse <- sqrt(mean((Y_flat - Pred_flat)^2))
+    
+    # Save the metrics if they improve
+    if (current_rmse < best_rmse) {
+      best_rmse <- current_rmse
+      rss <- sum((Y_flat - Pred_flat)^2)
+      tss <- sum((Y_flat - mean(Y_flat))^2)
+      
+      best_metrics <- list(
+        r2 = 1 - (rss / tss),
+        rmse = current_rmse,
+        mae = mean(abs(Y_flat - Pred_flat)),
+        best_mtry = m
+      )
+    }
+  }
+  return(best_metrics)
+}
+
+cforest_pipeline <- function(X_list, y_list, max_comp = 20, k_folds = 5) {
+  
+  final_results_CF <- data.frame()
+  
+  for (i in seq_along(X_list)) {
+    X <- X_list[[i]]
+    wavenumbers <- as.numeric(colnames(X))
+    X_raw <- baseline(X, wavenumbers)
+    
+    for(j in seq_along(y_list)){
+      y <- y_list[[j]]
+      dataset_name <- paste("Dataset", i , "with Ref", j)
+      
+      # Preprocessing Methods
+      prep <- list(
+          'Raw' = function(x) { savitzkyGolay(x, w = 15, p = 2, m = 0) },
+          'SNV' = function(x) { standardNormalVariate(savitzkyGolay(x, w = 15, p = 2, m = 0)) },
+          '1st_Der' = function(x) { savitzkyGolay(x, w = 9, p = 2, m = 1) },
+          '2nd_Der' = function(x) { savitzkyGolay(x, w = 9, p = 2, m = 2) },
+          'EMSC' = function(x) { 
+              df <- EMSC(savitzkyGolay(x, w = 15, p = 2, m = 0), degree = 2)
+              return(df$corrected) 
+          },
+          "RNV" = function(x) { rnv(x, r = 0.25) }
+      )
+      
+      for (prep_name in names(prep)) {
+        X_prep <- prep[[prep_name]](X_raw)
+        
+        # Variable Selection / Feature Extraction Methods
+        varsel <- list(
+            "None" = function(x, y_ref) { return(x) },
+            
+            "VIP" = function(x, y_ref) {
+                df <- filterPLSR(y_ref, x, ncomp = max_comp, ncomp.opt = "minimum", validation = "CV", segments = k_folds, VIP.threshold = 0.7)
+                vars <- as.numeric(df$VIP)
+                vars <- vars[!is.na(vars) & vars > 0]
+                if(length(vars) < 2) return(NULL)
+                return(x[, vars, drop = FALSE])
+            },
+            
+            "GA" = function(x, y_ref) {
+                set.seed(123)
+                df <- ga_pls(y_ref, x, GA.threshold = 10, iters = 10, popSize = 50)
+                vars <- as.numeric(df$ga.selection)
+                vars <- vars[!is.na(vars) & vars > 0]
+                if(length(vars) < 2) return(NULL)
+                return(x[, vars, drop = FALSE])
+            },
+            
+            "PCA" = function(x, y_ref) {
+                valid_cols <- apply(x, 2, var) > 1e-10
+                x_clean <- x[, valid_cols, drop = FALSE]
+                if(ncol(x_clean) < 2) return(NULL)
+                pca_mod <- prcomp(x_clean, center = TRUE, scale. = TRUE)
+                return(pca_mod$x[, 1:min(max_comp, ncol(pca_mod$x)), drop = FALSE])
+            },
+            
+            "Kernel_PCA" = function(x, y_ref) {
+                valid_cols <- apply(x, 2, var) > 1e-10
+                x_clean <- x[, valid_cols, drop = FALSE]
+                if(ncol(x_clean) < 2) return(NULL)
+                kpca_mod <- kpca(~., data = as.data.frame(x_clean), kernel = "rbfdot", features = max_comp)
+                return(rotated(kpca_mod))
+            }
+        )
+        
+        for (vs_name in names(varsel)) {
+          
+          X_sel <- varsel[[vs_name]](X_prep, y)
+          
+          if (is.null(X_sel) || ncol(X_sel) < 2) {
+            next
+          }
+          
+          # Call the Conditional Inference Forest Cross-Validation and Tuning function
+          cf_metrics <- cforest_cv_tune(X = X_sel, Y = y, folds = k_folds)
+          
+          final_results_CF <- rbind(final_results_CF, data.frame(
+            Dataset = dataset_name, 
+            Preprocessing = prep_name, 
+            Var_Selection = vs_name, 
+            Model_Method = "Conditional_Inference_Forest",
+            Best_Mtry = cf_metrics$best_mtry,
+            R2 = cf_metrics$r2,
+            RMSE = cf_metrics$rmse,
+            MAE = cf_metrics$mae
+          ))
+          
+          print(paste(dataset_name, "| Prep:", prep_name, "| Extractor:", vs_name, "| Tuned cforest is done!"))
+        }
+      }
+    }
+  }
+  print("cforest Pipeline execution completed!")
+  return(final_results_CF)
+}
+
+sec_str_cforest <- cforest_pipeline(X_list = X_list, y_list = y_coda)
+write.csv(sec_str_cforest, "cforest_pipeline_results.csv", row.names = FALSE)
+save.image("sec_structure.RData")
+```
+
+## Multivariate Adaptive Regression Splines (MARS)
+
+```{r}
+library(earth)
+
+mars_cv_tune <- function(X, Y, folds = 5) {
+  n_samples <- nrow(X)
+  n_cols <- ncol(Y)
+  
+  # Tune the degree of interactions
+  # degree = 1: additive model (fastest)
+  # degree = 2: allows two-way interactions between wavenumbers
+  degree_grid <- c(1, 2)
+  
+  set.seed(42)
+  fold_ids <- sample(rep(1:folds, length.out = n_samples))
+  
+  best_rmse <- Inf
+  best_metrics <- list()
+  
+  # Loop through our tuning grid
+  for (d in degree_grid) {
+    Y_pred_cv <- matrix(NA, nrow = n_samples, ncol = n_cols)
+    
+    for (k in 1:folds) {
+      train_idx <- which(fold_ids != k)
+      test_idx <- which(fold_ids == k)
+      
+      # Train MARS natively on the multi-output matrix
+      mars_model <- earth(x = X[train_idx, , drop = FALSE], 
+                          y = Y[train_idx, , drop = FALSE], 
+                          degree = d)
+      
+      # Predict the hold-out fold
+      preds <- predict(mars_model, newdata = X[test_idx, , drop = FALSE])
+      
+      # The earth package returns a matrix of predictions matching Y's dimensions!
+      Y_pred_cv[test_idx, ] <- preds
+    }
+    
+    # Calculate standard global metrics for this degree
+    Y_flat <- as.numeric(Y)
+    Pred_flat <- as.numeric(Y_pred_cv)
+    current_rmse <- sqrt(mean((Y_flat - Pred_flat)^2))
+    
+    # Save the absolute best results
+    if (current_rmse < best_rmse) {
+      best_rmse <- current_rmse
+      rss <- sum((Y_flat - Pred_flat)^2)
+      tss <- sum((Y_flat - mean(Y_flat))^2)
+      
+      best_metrics <- list(
+        r2 = 1 - (rss / tss),
+        rmse = current_rmse,
+        mae = mean(abs(Y_flat - Pred_flat)),
+        best_degree = d
+      )
+    }
+  }
+  
+  return(best_metrics)
+}
+
+mars_pipeline <- function(X_list, y_list, k_folds = 5) {
+  
+  final_results_mars <- data.frame()
+  
+  # loop through each dataset
+  for (i in seq_along(X_list)) {
+    X <- X_list[[i]]
+    wavenumbers <- as.numeric(colnames(X))
+    X_raw <- baseline(X, wavenumbers)
+    
+    for(j in seq_along(y_list)){
+      y <- y_list[[j]]
+      dataset_name <- paste("Dataset", i , "with Ref", j)
+            
+      # Preprocessing methods
+      prep <- list(
+          'Raw' = function(x) { savitzkyGolay(x, w = 15, p = 2, m = 0) },
+          'SNV' = function(x) { standardNormalVariate(savitzkyGolay(x, w = 15, p = 2, m = 0)) },
+          '1st_Der' = function(x) { savitzkyGolay(x, w = 9, p = 2, m = 1) },
+          '2nd_Der' = function(x) { savitzkyGolay(x, w = 9, p = 2, m = 2) },
+          'EMSC' = function(x) { 
+              df <- EMSC(savitzkyGolay(x, w = 15, p = 2, m = 0), degree = 2)
+              return(df$corrected) 
+          },
+          "RNV" = function(x) { rnv(x, r = 0.25) }
+      )
+      
+      for (prep_name in names(prep)) {
+        
+        # 1. Preprocess the data
+        X_prep <- prep[[prep_name]](X_raw)
+        
+        # 2. Go straight into MARS!
+        mars_metrics <- mars_cv_tune(X = X_prep, Y = y, folds = k_folds)
+        
+        # 3. Save the results
+        final_results_mars <- rbind(final_results_mars, data.frame(
+          Dataset = dataset_name, 
+          Preprocessing = prep_name, 
+          Var_Selection = "Built-in_MARS", 
+          Model_Method = "MARS_earth",
+          Best_Degree = mars_metrics$best_degree,
+          R2 = mars_metrics$r2,
+          RMSE = mars_metrics$rmse,
+          MAE = mars_metrics$mae
+        ))
+        
+        print(paste(dataset_name, "| Preprocessing:", prep_name, "| MARS is done!"))
+      }
+    }
+  }
+  print("MARS Pipeline execution completed!")
+  return(final_results_mars)
+}
+
+sec_str_mars <- mars_pipeline(X_list = X_list, y_list = y_coda)
+write.csv(sec_str_mars, "mars_pipeline_results.csv", row.names = FALSE)
+save.image("sec_structure.RData")i
+
 ```
